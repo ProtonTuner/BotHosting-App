@@ -13,12 +13,14 @@ permissions:
 
 jobs:
   build:
-    name: Compile Android APK
+    name: Build Android APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
     env:
       JAVA_VERSION: '17'
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
       ANDROID_PLATFORM: '35'
       ANDROID_BUILD_TOOLS: '35.0.0'
       GRADLE_VERSION: '8.9'
@@ -27,22 +29,31 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Java
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Configure Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept SDK licenses
+      - name: Configure preinstalled Android SDK
+        shell: bash
         run: |
-          yes | sdkmanager --licenses || true
+          set -euo pipefail
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
-      - name: Install Android SDK version 35
+          test -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --version
+
+      - name: Install Android SDK packages
+        shell: bash
         run: |
-          sdkmanager --install \
+          set -euo pipefail
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" --install \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
@@ -52,7 +63,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y unzip zip
 
-      - name: Find and extract Vesper Runtime
+      - name: Extract Vesper Runtime project
         shell: bash
         run: |
           set -euo pipefail
@@ -64,12 +75,9 @@ jobs:
 
           if [ -z "$ZIP_FILE" ]; then
             echo "::error::No se encontró vesper_runtime*.zip"
-            echo "Archivos ZIP encontrados:"
             find . -type f -iname '*.zip' -print
             exit 1
           fi
-
-          echo "Archivo: $ZIP_FILE"
 
           mkdir -p "$RUNNER_TEMP/vesper-source"
           unzip -q "$ZIP_FILE" -d "$RUNNER_TEMP/vesper-source"
@@ -80,61 +88,56 @@ jobs:
             -print -quit)"
 
           if [ -z "$SETTINGS_FILE" ]; then
-            echo "::error::El ZIP no contiene un proyecto Gradle."
+            echo "::error::El ZIP no contiene settings.gradle."
             find "$RUNNER_TEMP/vesper-source" \
               -maxdepth 4 -type f | head -100
             exit 1
           fi
 
           PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Proyecto detectado: $PROJECT_DIR"
+          echo "Proyecto: $PROJECT_DIR"
 
-      - name: Configure Gradle 8.9
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
-      - name: Compile APK
+      - name: Build debug APK
         shell: bash
         run: |
           set -euo pipefail
           cd "$PROJECT_DIR"
 
-          if [ -f "./gradlew" ]; then
+          if [ -f ./gradlew ]; then
             chmod +x ./gradlew
-            ./gradlew --version
             ./gradlew --no-daemon assembleDebug
           else
-            gradle --version
             gradle --no-daemon assembleDebug
           fi
 
-      - name: Locate generated APK
+      - name: Collect APK
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/apk-output"
 
-          APK_DIR="$RUNNER_TEMP/vesper-source"
+          find "$PROJECT_DIR" -type f -name '*.apk' \
+            -path '*/build/outputs/apk/*' \
+            -exec cp {} "$RUNNER_TEMP/apk-output/" \;
 
-          if [ -n "${PROJECT_DIR:-}" ]; then
-            APK_DIR="$PROJECT_DIR"
-          fi
-
-          find "$APK_DIR" -type f -name '*.apk' -print
-
-          if ! find "$APK_DIR" -type f -name '*.apk' \
-            -print -quit | grep -q .; then
-            echo "::error::La compilación terminó sin generar ningún APK."
+          if ! find "$RUNNER_TEMP/apk-output" \
+            -type f -name '*.apk' -print -quit | grep -q .; then
+            echo "::error::No se generó ningún APK."
             exit 1
           fi
 
-      - name: Upload APK
+          ls -lh "$RUNNER_TEMP/apk-output"
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: vesper-runtime-debug-apk
-          path: |
-            ${{ runner.temp }}/vesper-source/**/build/outputs/apk/**/*.apk
+          path: ${{ runner.temp }}/apk-output/*.apk
           if-no-files-found: error
           retention-days: 14
