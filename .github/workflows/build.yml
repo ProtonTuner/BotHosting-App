@@ -1,0 +1,72 @@
+name: Build APK desde ZIP
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Busca un .zip en la raiz del repo y lo extrae solo
+      - name: Extraer ZIP
+        run: |
+          ZIP=$(ls ./*.zip 2>/dev/null | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "No hay ningun .zip en la raiz del repositorio"
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/proj"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP/proj"
+          SETTINGS=$(find "$RUNNER_TEMP/proj" \( -name settings.gradle -o -name settings.gradle.kts \) -not -path "*/__MACOSX/*" | head -n 1)
+          if [ -z "$SETTINGS" ]; then
+            echo "El zip no contiene un proyecto Gradle (settings.gradle)"
+            exit 1
+          fi
+          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Chaquopy necesita un Python 3.11 en la maquina de compilacion
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Crear keystore si falta
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          if [ ! -f app/release.jks ]; then
+            keytool -genkeypair -keystore app/release.jks -alias key \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android -dname "CN=App"
+          fi
+
+      - name: Compilar APK release
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleRelease --no-daemon
+
+      # APK descargable directo desde la seccion Releases (sin zip)
+      - name: Publicar APK en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NAME=$(basename "$PROJECT_DIR")
+          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk | head -n 1)
+          cp "$APK" "$RUNNER_TEMP/$NAME.apk"
+          gh release create "v${{ github.run_number }}" "$RUNNER_TEMP/$NAME.apk" \
+            --title "$NAME v${{ github.run_number }}" \
+            --notes "APK compilado automaticamente" \
+            --repo "${{ github.repository }}"
