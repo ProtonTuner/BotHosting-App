@@ -22,10 +22,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Busca la carpeta que contiene settings.gradle + app/ (raíz del repo o una subcarpeta).
+      # Busca la carpeta que contiene settings.gradle + app/ (raíz, subcarpeta o dentro de un .zip).
       - name: Detectar carpeta del proyecto
         run: |
-          SG=$(find . -maxdepth 4 -name settings.gradle -not -path './.git/*' | while read f; do d=$(dirname "$f"); [ -d "$d/app" ] && echo "$d" && break; done)
+          buscar() {
+            find . -maxdepth 5 -name settings.gradle -not -path './.git/*' | while read f; do
+              d=$(dirname "$f"); [ -d "$d/app" ] && echo "$d" && break
+            done
+          }
+          SG=$(buscar)
+          if [ -z "$SG" ]; then
+            echo "No hay proyecto suelto; busco .zip en el repo..."
+            find . -maxdepth 3 -iname '*.zip' -not -path './.git/*' | while read z; do
+              echo "Descomprimiendo $z"
+              mkdir -p "_unzipped/$(basename "$z" .zip)"
+              unzip -qo "$z" -d "_unzipped/$(basename "$z" .zip)"
+            done
+            SG=$(buscar)
+          fi
           if [ -z "$SG" ]; then
             echo "::error::No encontré settings.gradle junto a una carpeta app/. Archivos del repo:"
             find . -maxdepth 3 -not -path './.git/*' | sort
