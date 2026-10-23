@@ -1,72 +1,110 @@
-name: Build APK desde ZIP
+name: Build APK (todo en uno)
 
+# Compila TODO en una sola ejecución: librerías de música (davey, libopus, ffmpeg) + APK.
+# - Con push o "Run workflow" (music = true, por defecto) incluye la música.
+# - Con "Run workflow" y music = false compila el APK ligero (32 y 64 bits, sin música).
 on:
   push:
-    branches: [ main, master ]
   workflow_dispatch:
+    inputs:
+      music:
+        description: "Incluir música (davey + libopus + ffmpeg)"
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
+  contents: write   # necesario para crear el Release
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      MUSIC: ${{ github.event.inputs.music != 'false' }}
     steps:
       - uses: actions/checkout@v4
-
-      # Busca un .zip en la raiz del repo y lo extrae solo
-      - name: Extraer ZIP
-        run: |
-          ZIP=$(ls ./*.zip 2>/dev/null | head -n 1)
-          if [ -z "$ZIP" ]; then
-            echo "No hay ningun .zip en la raiz del repositorio"
-            exit 1
-          fi
-          mkdir -p "$RUNNER_TEMP/proj"
-          unzip -q "$ZIP" -d "$RUNNER_TEMP/proj"
-          SETTINGS=$(find "$RUNNER_TEMP/proj" \( -name settings.gradle -o -name settings.gradle.kts \) -not -path "*/__MACOSX/*" | head -n 1)
-          if [ -z "$SETTINGS" ]; then
-            echo "El zip no contiene un proyecto Gradle (settings.gradle)"
-            exit 1
-          fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
 
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
-
-      # Chaquopy necesita un Python 3.11 en la maquina de compilacion
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+          java-version: 17
 
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '8.7'
+          gradle-version: "8.9"
 
-      - name: Crear keystore si falta
-        working-directory: ${{ env.PROJECT_DIR }}
+      # ---------- Keystore ----------
+      # Con el secret KEYSTORE_BASE64 las actualizaciones se instalan encima de la versión anterior.
+      - name: Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          if [ ! -f app/release.jks ]; then
-            keytool -genkeypair -keystore app/release.jks -alias key \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass android -keypass android -dname "CN=App"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > app/release.jks
+          else
+            keytool -genkeypair -keystore app/release.jks -storepass android -keypass android \
+              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=BotHost"
           fi
 
+      # ---------- Música (opcional) ----------
+      - name: APK debug (para extraer libpython3.11.so)
+        if: env.MUSIC == 'true'
+        run: |
+          rm -f app/wheels/*.whl
+          gradle assembleDebug --no-daemon
+          mkdir -p /tmp/pylib
+          unzip -j app/build/outputs/apk/debug/*.apk 'lib/arm64-v8a/libpython3.11.so' -d /tmp/pylib
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: env.MUSIC == 'true'
+        with:
+          targets: aarch64-linux-android
+
+      - name: davey (Rust -> wheel Android)
+        if: env.MUSIC == 'true'
+        run: python3 tools/make_davey_wheel.py --pylib /tmp/pylib --out app/wheels
+
+      - name: libopus (NDK + CMake)
+        if: env.MUSIC == 'true'
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git /tmp/opus
+          cmake -S /tmp/opus -B /tmp/opus-build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
+            -DOPUS_BUILD_PROGRAMS=OFF -DOPUS_BUILD_TESTING=OFF \
+            -DCMAKE_SHARED_LINKER_FLAGS="-Wl,-z,max-page-size=16384"
+          cmake --build /tmp/opus-build -j"$(nproc)"
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          cp "$(find /tmp/opus-build -name 'libopus.so*' -type f | head -1)" app/src/main/jniLibs/arm64-v8a/libopus.so
+          "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded app/src/main/jniLibs/arm64-v8a/libopus.so
+
+      - name: ffmpeg estático arm64
+        if: env.MUSIC == 'true'
+        run: |
+          pip download imageio-ffmpeg==0.6.0 --platform manylinux2014_aarch64 --only-binary=:all: --no-deps -d /tmp/iff
+          unzip -qo /tmp/iff/*.whl -d /tmp/iff/x
+          cp /tmp/iff/x/imageio_ffmpeg/binaries/ffmpeg-linux-aarch64-* app/src/main/jniLibs/arm64-v8a/libffmpeg.so
+          ls -la app/wheels app/src/main/jniLibs/arm64-v8a
+
+      # ---------- APK final ----------
+      # build.gradle detecta wheels/ y jniLibs/ y activa la música solo.
       - name: Compilar APK release
-        working-directory: ${{ env.PROJECT_DIR }}
         run: gradle assembleRelease --no-daemon
 
-      # APK descargable directo desde la seccion Releases (sin zip)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: BotHost-apk
+          path: app/build/outputs/apk/release/*.apk
+
+      # ---------- Publicar en Releases ----------
       - name: Publicar APK en Releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          NAME=$(basename "$PROJECT_DIR")
-          APK=$(ls "$PROJECT_DIR"/app/build/outputs/apk/release/*.apk | head -n 1)
-          cp "$APK" "$RUNNER_TEMP/$NAME.apk"
-          gh release create "v${{ github.run_number }}" "$RUNNER_TEMP/$NAME.apk" \
-            --title "$NAME v${{ github.run_number }}" \
-            --notes "APK compilado automaticamente" \
-            --repo "${{ github.repository }}"
+          TAG="build-${{ github.run_number }}"
+          cp app/build/outputs/apk/release/*.apk BotHost.apk
+          gh release create "$TAG" BotHost.apk \
+            --title "BotHost build ${{ github.run_number }}" \
+            --notes "Compilado desde $(git rev-parse --short HEAD). Música: $MUSIC" \
+            --target "${{ github.sha }}"
