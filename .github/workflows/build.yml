@@ -1,8 +1,7 @@
 name: Build APK (todo en uno)
 
-# Compila TODO en una sola ejecución: librerías de música (davey, libopus, ffmpeg) + APK.
-# - Con push o "Run workflow" (music = true, por defecto) incluye la música.
-# - Con "Run workflow" y music = false compila el APK ligero (32 y 64 bits, sin música).
+# Compila TODO en una sola ejecución: librerías de música (davey, libopus, ffmpeg) + APK,
+# y publica el APK en Releases. Detecta solo en qué carpeta está el proyecto.
 on:
   push:
   workflow_dispatch:
@@ -23,6 +22,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Busca la carpeta que contiene settings.gradle + app/ (raíz del repo o una subcarpeta).
+      - name: Detectar carpeta del proyecto
+        run: |
+          SG=$(find . -maxdepth 4 -name settings.gradle -not -path './.git/*' | while read f; do d=$(dirname "$f"); [ -d "$d/app" ] && echo "$d" && break; done)
+          if [ -z "$SG" ]; then
+            echo "::error::No encontré settings.gradle junto a una carpeta app/. Archivos del repo:"
+            find . -maxdepth 3 -not -path './.git/*' | sort
+            exit 1
+          fi
+          echo "Proyecto en: $SG"
+          echo "PD=$SG" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -38,6 +49,7 @@ jobs:
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
+          cd "$PD"
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > app/release.jks
           else
@@ -49,6 +61,8 @@ jobs:
       - name: APK debug (para extraer libpython3.11.so)
         if: env.MUSIC == 'true'
         run: |
+          cd "$PD"
+          mkdir -p app/wheels
           rm -f app/wheels/*.whl
           gradle assembleDebug --no-daemon
           mkdir -p /tmp/pylib
@@ -61,11 +75,14 @@ jobs:
 
       - name: davey (Rust -> wheel Android)
         if: env.MUSIC == 'true'
-        run: python3 tools/make_davey_wheel.py --pylib /tmp/pylib --out app/wheels
+        run: |
+          cd "$PD"
+          python3 tools/make_davey_wheel.py --pylib /tmp/pylib --out app/wheels
 
       - name: libopus (NDK + CMake)
         if: env.MUSIC == 'true'
         run: |
+          cd "$PD"
           NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
           git clone --depth 1 --branch v1.5.2 https://github.com/xiph/opus.git /tmp/opus
           cmake -S /tmp/opus -B /tmp/opus-build \
@@ -82,6 +99,7 @@ jobs:
       - name: ffmpeg estático arm64
         if: env.MUSIC == 'true'
         run: |
+          cd "$PD"
           pip download imageio-ffmpeg==0.6.0 --platform manylinux2014_aarch64 --only-binary=:all: --no-deps -d /tmp/iff
           unzip -qo /tmp/iff/*.whl -d /tmp/iff/x
           cp /tmp/iff/x/imageio_ffmpeg/binaries/ffmpeg-linux-aarch64-* app/src/main/jniLibs/arm64-v8a/libffmpeg.so
@@ -90,21 +108,22 @@ jobs:
       # ---------- APK final ----------
       # build.gradle detecta wheels/ y jniLibs/ y activa la música solo.
       - name: Compilar APK release
-        run: gradle assembleRelease --no-daemon
+        run: |
+          cd "$PD"
+          gradle assembleRelease --no-daemon
 
       - uses: actions/upload-artifact@v4
         with:
           name: BotHost-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: ${{ env.PD }}/app/build/outputs/apk/release/*.apk
 
       # ---------- Publicar en Releases ----------
       - name: Publicar APK en Releases
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="build-${{ github.run_number }}"
-          cp app/build/outputs/apk/release/*.apk BotHost.apk
-          gh release create "$TAG" BotHost.apk \
+          cp "$PD"/app/build/outputs/apk/release/*.apk BotHost.apk
+          gh release create "build-${{ github.run_number }}" BotHost.apk \
             --title "BotHost build ${{ github.run_number }}" \
             --notes "Compilado desde $(git rev-parse --short HEAD). Música: $MUSIC" \
             --target "${{ github.sha }}"
