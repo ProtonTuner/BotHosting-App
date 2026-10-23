@@ -96,6 +96,32 @@ jobs:
         if: env.MUSIC == 'true'
         run: |
           cd "$PD"
+          # Parche: PyO3 no encuentra _sysconfigdata en /tmp/pylib. Se le da la config de
+          # Python con un archivo (PYO3_CONFIG_FILE) en vez de PYO3_CROSS_LIB_DIR.
+          python3 - <<'PYEOF'
+          p = "tools/make_davey_wheel.py"
+          s = open(p, encoding="utf-8").read()
+          old_env = (
+              '        "PYO3_CROSS": "1",\n'
+              '        "PYO3_CROSS_LIB_DIR": pylib,\n'
+              '        "PYO3_CROSS_PYTHON_VERSION": PYVER,\n'
+              '        "PYO3_CROSS_PYTHON_IMPLEMENTATION": "CPython",\n'
+          )
+          assert old_env in s, "no encontré el bloque PYO3_CROSS en make_davey_wheel.py"
+          s = s.replace(old_env, '        "PYO3_CONFIG_FILE": cfg,\n')
+          anchor = "    env = dict(os.environ)\n"
+          assert s.count(anchor) == 1
+          cfg_code = (
+              '    cfg = os.path.join(tmp, "pyo3-config.txt")\n'
+              '    open(cfg, "w").write("\\n".join([\n'
+              '        "implementation=CPython", "version=" + PYVER, "shared=true", "abi3=false",\n'
+              '        "lib_name=python" + PYVER, "lib_dir=" + pylib, "pointer_width=64",\n'
+              '        "build_flags=", "suppress_build_script_link_lines=false", ""]))\n'
+          )
+          s = s.replace(anchor, cfg_code + anchor)
+          open(p, "w", encoding="utf-8").write(s)
+          PYEOF
+          python3 -m py_compile tools/make_davey_wheel.py
           python3 tools/make_davey_wheel.py --pylib /tmp/pylib --out app/wheels
 
       - name: libopus (NDK + CMake)
